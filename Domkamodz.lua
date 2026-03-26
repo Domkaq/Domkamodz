@@ -58,7 +58,7 @@ local Config = {
     SilentForceHead = true,
     HitChance       = 0.55,
     KillCooldown    = 2.0,
-    DamageSync      = true,
+    DamageSync      = false,
     -- BulletTP
     BulletTPEnabled = false,
     BulletTPMult    = 50,
@@ -77,12 +77,14 @@ local Config = {
     NoRecoil        = false,
     NoSpread        = false,
     InfiniteAmmo    = false,
+    RapidFire       = false,
+    RapidFireDelay  = 0.01,
     -- Hitbox & Auto-Wall
     HitboxEnabled   = false,
     HitboxSize      = 3,
     AutoWallEnabled = false,
     -- Smart Aim
-    SmartAimEnabled = true,
+    SmartAimEnabled = false,
     HeadJitter      = 0.15,
     StickyAim       = true,
     -- ESP
@@ -92,8 +94,8 @@ local Config = {
     HealthBar       = true,
     DistESP         = true,
     NameESP         = true,
-    WeaponESP       = true,
-    AmmoESP         = true,
+    WeaponESP       = false,
+    AmmoESP         = false,
     GlowESP        = false,
     TeamCheck       = true,
     -- World ESP
@@ -288,6 +290,11 @@ local function buildIgnore()
 end
 
 ------------------------------------------------------------------------
+-- 5b. FORWARD: GameInt (must be before captureWeapon/restoreWeapon)
+------------------------------------------------------------------------
+local GameInt = {}
+
+------------------------------------------------------------------------
 -- 6. WEAPON VALUE STORAGE
 ------------------------------------------------------------------------
 local OrigVals   = {}
@@ -312,23 +319,23 @@ local function captureWeapon(gun)
     OrigVals = {ok=true}
     -- Temporarily disable hooks so we read TRUE stored values, not our overridden ones
     _hookGuard=true; _hookGuardTk=tick()
-    for _,n in ipairs(GUN_VALS) do
-        local v = gun:FindFirstChild(n)
-        if v then
-            local val = v.Value
-            if typeof(val)=="string" then val = tonumber(val) end
-            if typeof(val)=="number" then OrigVals[n] = val end
-        end
-    end
     pcall(function()
+        for _,n in ipairs(GUN_VALS) do
+            local v = gun:FindFirstChild(n)
+            if v then
+                local val = v.Value
+                if typeof(val)=="string" then val = tonumber(val) end
+                if typeof(val)=="number" then OrigVals[n] = val end
+            end
+        end
         local mf = gun:FindFirstChild("Multipliers")
         if mf then OrigVals.Multipliers = {}
             for _,mv in ipairs(mf:GetChildren()) do
                 if mv:IsA("NumberValue") then OrigVals.Multipliers[mv.Name] = mv.Value end
             end
         end
+        local bs = gun:FindFirstChild("BulletSize"); if bs then OrigVals.BulletSize = bs.Value end
     end)
-    pcall(function() local bs = gun:FindFirstChild("BulletSize"); if bs then OrigVals.BulletSize = bs.Value end end)
     _hookGuard=false
     -- Snapshot GC table originals if available
     pcall(function()
@@ -358,18 +365,11 @@ local function restoreWeapon(gun)
             pcall(function() v.Value = OrigVals[n] end)
         end
     end
-    if GameInt.WeaponModule then
-        local wm = GameInt.WeaponModule
-        for _,k in ipairs({"Recoil","LRecoil","RRecoil","Spread","BulletDrop"}) do
-            if OrigVals[k] and type(rawget(wm,k))=="number" then wm[k]=OrigVals[k] end
-        end
-    end
 end
 
 ------------------------------------------------------------------------
 -- 7. FORWARD DECLARATIONS & STATE
 ------------------------------------------------------------------------
-local GameInt = {}
 local getClosestTarget, getBone, findGun
 local BacktrackHistory = {}
 local _prevVelocity    = {}
@@ -702,6 +702,16 @@ local function getAimPos(p)
 end
 
 ------------------------------------------------------------------------
+-- 10b. RAW METATABLE CAPTURE (MUST happen before any hookmetamethod)
+-- hookmetamethod internally modifies the metatable — if we capture
+-- AFTER it runs, getrawmetatable may return a corrupted reference.
+-- The standalone script works because it never calls hookmetamethod.
+------------------------------------------------------------------------
+local _hookMT = getrawmetatable(game)
+local oldIndex = _hookMT.__index
+local oldNewIndex = _hookMT.__newindex
+
+------------------------------------------------------------------------
 -- 11. NAMECALL HOOK
 ------------------------------------------------------------------------
 local SANITIZE_IDX = {5,6,7,11,12}
@@ -767,14 +777,16 @@ oldNamecall = hookmetamethod(game,"__namecall",newcclosure(function(self,...)
                             local origDir = typeof(args[3])=="Vector3" and args[3].Unit or Camera.CFrame.LookVector
                             local newDir = delta.Unit
                             local dotAngle = origDir:Dot(newDir)
-                            -- Only redirect if angle < ~35 degrees (dot > 0.82) to avoid server kick
-                            if dotAngle > 0.82 or Config.BulletTPEnabled then
+                            -- Redirect: silent/BTP always redirect, legit checks angle
+                            if silentOn or btpOn or dotAngle > 0.5 then
                                 args[1]  = bone
                                 args[2]  = hitPos
                                 args[3]  = newDir
                                 args[10] = origin
-                                if Rem.DistributedTime and Rem.DistributedTime:IsA("NumberValue") then
-                                    args[11] = Rem.DistributedTime.Value
+                                if Rem.DistributedTime then
+                                    local dtv = Rem.DistributedTime.Value
+                                    if typeof(dtv)=="string" then dtv = tonumber(dtv) end
+                                    if dtv then args[11] = dtv end
                                 end
                                 if Config.DamageSync and typeof(args[5])=="number" and OrigVals.Damage then
                                     args[5] = OrigVals.Damage * getServerMultiplier(bone.Name)
@@ -832,134 +844,51 @@ oldNamecall = hookmetamethod(game,"__namecall",newcclosure(function(self,...)
 end))
 
 ------------------------------------------------------------------------
--- 12. __index HOOK — weapon values + BulletTP speed
+-- 12-13. METAMETHOD HOOKS (rawmetatable — Wave-compatible)
+-- _hookMT, oldIndex, oldNewIndex captured in 10b BEFORE hookmetamethod.
+-- Re-install on the pre-captured reference so hookmetamethod can't corrupt.
 ------------------------------------------------------------------------
-local oldIndex
-oldIndex = hookmetamethod(game,"__index",newcclosure(function(self,key)
+setreadonly(_hookMT, false)
+
+-- 12a. __index — spoof weapon value reads (NumberValue ONLY, like standalone)
+_hookMT.__index = newcclosure(function(self, key)
     if _hookGuard then
         if tick()-_hookGuardTk>0.05 then _hookGuard=false else return oldIndex(self,key) end
     end
-    if not checkcaller() and key=="Value" and typeof(self)=="Instance" then
-        -- Fast path: skip pcall for values NOT in the active gun
-        local qg = CachedGun
-        if qg then
-            if self.Parent ~= qg then return oldIndex(self, key) end
-        elseif not _anyWpnFeat then
-            return oldIndex(self, key)
+    if not checkcaller() and key=="Value" and typeof(self)=="Instance" and self:IsA("NumberValue") then
+        local name = self.Name
+        if Config.NoRecoil and (name=="Recoil" or name=="LRecoil" or name=="RRecoil") then
+            return 0
         end
-        local ok,ret = pcall(function()
-            if not (self:IsA("NumberValue") or self:IsA("IntValue")) then return nil end
-            local gun = CachedGun
-            if not gun or not gun.Parent then
-                _hookGuard=true; _hookGuardTk=tick()
-                local c = LP.Character
-                gun = c and c:FindFirstChild("Gun")
-                _hookGuard=false
+        if Config.NoSpread and name=="Spread" then
+            return 0
+        end
+        if Config.InfiniteAmmo and name=="Ammo" then
+            return 999
+        end
+        if Config.RapidFire and name=="FireRate" then
+            return Config.RapidFireDelay
+        end
+        if Config.BulletTPEnabled then
+            if name=="BulletSpeed" and OrigVals.BulletSpeed then
+                return Config.BulletTPMode=="Speed"
+                    and OrigVals.BulletSpeed * Config.BulletTPMult
+                    or  OrigVals.BulletSpeed
             end
-            if not gun then return nil end
-            local par = self.Parent
-            if par ~= gun then return nil end
-            _hookGuard=true; _hookGuardTk=tick()
-            local name = self.Name
-            _hookGuard=false
-            if Config.NoRecoil and (name=="Recoil" or name=="LRecoil" or name=="RRecoil") then
-                return 0
-            end
-            if Config.NoSpread and name=="Spread" then
-                return 0
-            end
-            if Config.BulletTPEnabled and name=="BulletSpeed" and OrigVals.BulletSpeed then
-                if Config.BulletTPMode=="Speed" then
-                    return OrigVals.BulletSpeed * Config.BulletTPMult
-                else
-                    return OrigVals.BulletSpeed
-                end
-            end
-            if Config.BulletTPEnabled and name=="BulletDrop" then
-                return 0
-            end
-            if Config.InfiniteAmmo and name=="Ammo" then
-                _hookGuard=true; _hookGuardTk=tick()
-                local bi = gun:FindFirstChild("BI")
-                local val = bi and bi.Value
-                _hookGuard=false
-                if typeof(val)=="number" then return val end
-            end
-            -- Safety: read actual value for ALL gun children, convert string→number
-            _hookGuard=true; _hookGuardTk=tick()
-            local raw = oldIndex(self,key)
-            _hookGuard=false
-            if typeof(raw)=="string" then
-                local num = tonumber(raw)
-                if num then return num end
-            end
-            return raw
-        end)
-        _hookGuard=false
-        if ok and ret~=nil then return ret end
+            if name=="BulletDrop" then return 0 end
+        end
     end
     return oldIndex(self,key)
-end))
+end)
 
-------------------------------------------------------------------------
--- 13. __newindex HOOK — block server value resets
-------------------------------------------------------------------------
-local oldNewIndex
-oldNewIndex = hookmetamethod(game,"__newindex",newcclosure(function(self,key,value)
-    if _hookGuard then
-        if tick()-_hookGuardTk>0.05 then _hookGuard=false else return oldNewIndex(self,key,value) end
-    end
-    if not checkcaller() and key=="Value" and typeof(self)=="Instance" then
-        -- Fast path: skip pcall for values NOT in the active gun
-        local qg = CachedGun
-        if qg then
-            if self.Parent ~= qg then return oldNewIndex(self, key, value) end
-        elseif not _anyWpnFeat then
-            return oldNewIndex(self, key, value)
-        end
-        local ok,override,oval = pcall(function()
-            if not (self:IsA("NumberValue") or self:IsA("IntValue")) then return false end
-            local gun = CachedGun
-            if not gun or not gun.Parent then
-                _hookGuard=true; _hookGuardTk=tick()
-                local c = LP.Character
-                gun = c and c:FindFirstChild("Gun")
-                _hookGuard=false
-            end
-            if gun and self.Parent==gun then
-                _hookGuard=true; _hookGuardTk=tick()
-                local name = self.Name
-                _hookGuard=false
-                if Config.NoRecoil and (name=="Recoil" or name=="LRecoil" or name=="RRecoil") then
-                    return true, 0
-                end
-                if Config.NoSpread and name=="Spread" then
-                    return true, 0
-                end
-                if Config.InfiniteAmmo and name=="Ammo" then
-                    _hookGuard=true; _hookGuardTk=tick()
-                    local bi = gun:FindFirstChild("BI")
-                    local mx = bi and bi.Value
-                    _hookGuard=false
-                    if typeof(mx)=="number" then return true, mx end
-                end
-            end
-            if typeof(value)=="string" then
-                local num = tonumber(value)
-                if num then return true, num end
-                -- Non-numeric string: block write to prevent crash
-                _hookGuard=true; _hookGuardTk=tick()
-                local cur = oldIndex(self, "Value")
-                _hookGuard=false
-                return true, (typeof(cur)=="number" and cur or 0)
-            end
-            return false
-        end)
-        _hookGuard=false
-        if ok and override then return oldNewIndex(self,key,oval) end
-    end
-    return oldNewIndex(self,key,value)
-end))
+-- 12b. __newindex — pass-through (standalone has NO __newindex hook;
+-- the old catch-all string→number conversion was causing
+-- 'Unable to cast Vector3 to bool' in the game's firebullet)
+_hookMT.__newindex = newcclosure(function(self, key, value)
+    return oldNewIndex(self, key, value)
+end)
+
+setreadonly(_hookMT, true)
 
 ------------------------------------------------------------------------
 -- 14. ANTI-KICK
@@ -1132,6 +1061,11 @@ local function setVal(obj,val)
     elseif obj:IsA("IntValue") then
         local r = mFloor(val+0.5)
         if obj.Value~=r then pcall(function() obj.Value=r end) end
+    elseif obj:IsA("StringValue") then
+        local s = tostring(val)
+        if obj.Value~=s then pcall(function() obj.Value=s end) end
+    else
+        pcall(function() obj.Value=val end)
     end
 end
 
@@ -1143,38 +1077,34 @@ local function modWeapon()
     local isNewGun = (gun ~= LastGun)
     captureWeapon(gun)
     if isNewGun and not GameInt.WeaponModule then pcall(scanGC) end
+    -- Direct writes like the standalone script — no setVal, no comparisons
     for _,n in ipairs(RECOIL_KEYS) do
         local v = gun:FindFirstChild(n)
-        if v and OrigVals[n] then
-            setVal(v, Config.NoRecoil and 0 or OrigVals[n])
+        if v then
+            if Config.NoRecoil then
+                pcall(function() v.Value = 0 end)
+            elseif OrigVals[n] then
+                pcall(function() v.Value = OrigVals[n] end)
+            end
         end
     end
     local sp = gun:FindFirstChild("Spread")
-    if sp and OrigVals.Spread then
-        setVal(sp, Config.NoSpread and 0 or OrigVals.Spread)
+    if sp then
+        if Config.NoSpread then
+            pcall(function() sp.Value = 0 end)
+        elseif OrigVals.Spread then
+            pcall(function() sp.Value = OrigVals.Spread end)
+        end
     end
     if Config.InfiniteAmmo then
         local a = gun:FindFirstChild("Ammo")
         local bi = gun:FindFirstChild("BI")
-        if a and bi and tonumber(bi.Value) then setVal(a,bi.Value) end
+        local biVal = bi and (typeof(bi.Value)=="number" and bi.Value or tonumber(bi.Value)) or 999
+        if a then pcall(function() a.Value = biVal end) end
     end
-    if GameInt.WeaponModule then
-        local wm = GameInt.WeaponModule
-        for _,k in ipairs(RECOIL_KEYS) do
-            if type(rawget(wm,k))=="number" and OrigVals[k] then
-                wm[k] = Config.NoRecoil and 0 or OrigVals[k]
-            end
-        end
-        if type(rawget(wm,"Spread"))=="number" and OrigVals.Spread then
-            wm.Spread = Config.NoSpread and 0 or OrigVals.Spread
-        end
-        if type(rawget(wm,"BulletDrop"))=="number" then
-            wm.BulletDrop = Config.NoSpread and 0 or (OrigVals.BulletDrop or rawget(wm,"BulletDrop"))
-        end
-        if Config.InfiniteAmmo then
-            local bi = type(rawget(wm,"BI"))=="number" and rawget(wm,"BI") or nil
-            if bi and type(rawget(wm,"Ammo"))=="number" then wm.Ammo = bi end
-        end
+    if Config.RapidFire then
+        local fr = gun:FindFirstChild("FireRate")
+        if fr then pcall(function() fr.Value = Config.RapidFireDelay end) end
     end
 end
 
@@ -1190,30 +1120,59 @@ local function applySpeed()
 end
 
 ------------------------------------------------------------------------
--- 17b. ANTI-AIM DESYNC (FIXED: jitters Neck joint, not HRP)
+-- 17b. ANTI-AIM DESYNC (rotates Neck + Waist for full body desync)
 ------------------------------------------------------------------------
 local _aaFlip = false
-local _aaNeckObj = nil
-local _aaNeckBase = nil
+local _aaNeckObj, _aaNeckBase = nil, nil
+local _aaWaistObj, _aaWaistBase = nil, nil
 local function restoreNeck()
     pcall(function()
         if _aaNeckObj and _aaNeckBase and _aaNeckObj.Parent then
             _aaNeckObj.C0 = _aaNeckBase
         end
+        if _aaWaistObj and _aaWaistBase and _aaWaistObj.Parent then
+            _aaWaistObj.C0 = _aaWaistBase
+        end
     end)
 end
 local function applyAntiAim()
     local c = LP.Character
-    if not c then _aaNeckObj=nil; _aaNeckBase=nil; return end
+    if not c then _aaNeckObj=nil; _aaNeckBase=nil; _aaWaistObj=nil; _aaWaistBase=nil; return end
+    -- Find Neck (Head rotation)
     local head = c:FindFirstChild("Head")
-    if not head then return end
-    local neck = head:FindFirstChild("Neck") or c:FindFirstChild("Neck")
-    if not neck or not neck:IsA("Motor6D") then return end
-    if neck ~= _aaNeckObj then _aaNeckObj=neck; _aaNeckBase=neck.C0 end
+    if head then
+        local neck = head:FindFirstChild("Neck") or c:FindFirstChild("Neck")
+        if neck and neck:IsA("Motor6D") then
+            if neck ~= _aaNeckObj then _aaNeckObj=neck; _aaNeckBase=neck.C0 end
+        end
+    end
+    -- Find Waist/Root (Body rotation)
+    local ut = c:FindFirstChild("UpperTorso")
+    if ut then
+        local waist = ut:FindFirstChild("Waist")
+        if waist and waist:IsA("Motor6D") then
+            if waist ~= _aaWaistObj then _aaWaistObj=waist; _aaWaistBase=waist.C0 end
+        end
+    end
+    if not _aaWaistObj then
+        local lt = c:FindFirstChild("LowerTorso")
+        if lt then
+            local root = lt:FindFirstChild("Root")
+            if root and root:IsA("Motor6D") then
+                if root ~= _aaWaistObj then _aaWaistObj=root; _aaWaistBase=root.C0 end
+            end
+        end
+    end
     if not Config.AntiAimOn then restoreNeck(); return end
     _aaFlip = not _aaFlip
-    local jitter = _aaFlip and 3.14 or (mRand()-0.5)*2.5
-    pcall(function() neck.C0 = _aaNeckBase * CFa(0, jitter, 0) end)
+    local headJitter = _aaFlip and 3.14 or (mRand()-0.5)*2.5
+    local bodyJitter = _aaFlip and -2.8 or (mRand()-0.5)*2.0
+    if _aaNeckObj and _aaNeckBase then
+        pcall(function() _aaNeckObj.C0 = _aaNeckBase * CFa(0, headJitter, 0) end)
+    end
+    if _aaWaistObj and _aaWaistBase then
+        pcall(function() _aaWaistObj.C0 = _aaWaistBase * CFa(0, bodyJitter, 0) end)
+    end
 end
 
 ------------------------------------------------------------------------
@@ -1613,10 +1572,10 @@ local SnapLine = newDraw("Line",{Thickness=1.5,Color=Theme.accent(),Visible=fals
 
 -- Crosshair
 local Crosshair = {
-    newDraw("Line",{Thickness=1.5,Color=Color3.new(1,1,1),Visible=false,Transparency=0}),
-    newDraw("Line",{Thickness=1.5,Color=Color3.new(1,1,1),Visible=false,Transparency=0}),
-    newDraw("Line",{Thickness=1.5,Color=Color3.new(1,1,1),Visible=false,Transparency=0}),
-    newDraw("Line",{Thickness=1.5,Color=Color3.new(1,1,1),Visible=false,Transparency=0}),
+    newDraw("Line",{Thickness=1.5,Color=Color3.new(1,1,1),Visible=false,Transparency=1}),
+    newDraw("Line",{Thickness=1.5,Color=Color3.new(1,1,1),Visible=false,Transparency=1}),
+    newDraw("Line",{Thickness=1.5,Color=Color3.new(1,1,1),Visible=false,Transparency=1}),
+    newDraw("Line",{Thickness=1.5,Color=Color3.new(1,1,1),Visible=false,Transparency=1}),
 }
 
 -- Hit Marker (X flash on redirect)
@@ -1804,7 +1763,6 @@ local function createTab(name,icon,order)
     b.BackgroundTransparency=1; b.Size=UDim2.new(1,0,0,32); b.BorderSizePixel=0; b.LayoutOrder=order or 0
     b.TextXAlignment=Enum.TextXAlignment.Left; b.AutoButtonColor=false; b.ClipsDescendants=true; b.Parent=SB
     Instance.new("UICorner",b).CornerRadius=UDim.new(0,7)
-    Instance.new("UIPadding",b).PaddingLeft=UDim.new(0,10)
     local ind=Instance.new("Frame"); ind.Size=UDim2.new(0,3,.55,0); ind.AnchorPoint=V2(0,.5)
     ind.Position=UDim2.new(0,-7,.5,0); ind.BackgroundColor3=Theme.accent(); ind.BorderSizePixel=0; ind.Visible=false; ind.Parent=b
     Instance.new("UICorner",ind).CornerRadius=UDim.new(1,0)
@@ -1927,7 +1885,7 @@ local function addKeybind(pg,label,key)
         if typeof(val)=="EnumItem" then kb.Text="["..val.Name.."]" else kb.Text="[???]" end
     end; updateText()
     kb.MouseButton1Click:Connect(function() listening=true; kb.Text="[...]"; kb.TextColor3=Theme.warning() end)
-    UIS.InputBegan:Connect(function(i,gpe) if not listening then return end; if gpe then return end
+    UIS.InputEnded:Connect(function(i,gpe) if not listening then return end; if gpe then return end
         listening=false
         if i.UserInputType==Enum.UserInputType.Keyboard then Config[key]=i.KeyCode
         elseif i.UserInputType==Enum.UserInputType.MouseButton2 or i.UserInputType==Enum.UserInputType.MouseButton3 then Config[key]=i.UserInputType end
@@ -1958,7 +1916,7 @@ addTgl(t1.page,"Triggerbot","TriggerEnabled")
 addSld(t1.page,"Trigger Delay","TriggerDelay",0,.3,.01,"s")
 addTgl(t1.page,"Backtrack","BacktrackOn")
 addSld(t1.page,"Backtrack Ticks","BacktrackTicks",1,12,1,"")
-addSec(t1.page,"Silent Aim")
+addSec(t1.page,"Silent Aim [WIP]")
 addTgl(t1.page,"Force Headshot","SilentForceHead")
 addSld(t1.page,"Hit Chance","HitChance",.2,1,.05,"")
 addSld(t1.page,"Kill Cooldown","KillCooldown",0,5,.5,"s")
@@ -1998,12 +1956,8 @@ addSec(t2.page,"Lighting")
 addTgl(t2.page,"Fullbright","Fullbright")
 
 local t3=createTab("Exploits","[E]",3)
-addSec(t3.page,"Weapon Mods")
-addTgl(t3.page,"No Recoil","NoRecoil")
-addTgl(t3.page,"No Spread","NoSpread")
-addTgl(t3.page,"Infinite Ammo","InfiniteAmmo")
-addSec(t3.page,"Bullet Teleport")
-addTgl(t3.page,"Bullet TP","BulletTPEnabled")
+addSec(t3.page,"Bullet Teleport [WIP]")
+addTgl(t3.page,"Bullet TP [WIP]","BulletTPEnabled")
 addDrop(t3.page,"BTP Mode","BulletTPMode",{"Speed","Redirect"})
 addSld(t3.page,"BTP Speed Mult","BulletTPMult",5,100,5,"x")
 addSec(t3.page,"Hitbox")
@@ -2018,6 +1972,13 @@ addSld(t3.page,"3P Distance","ThirdPersonDist",3,20,1,"")
 addSld(t3.page,"3P Smoothing","ThirdPersonSmooth",0.01,1,0.01,"")
 addSec(t3.page,"Advanced")
 addBtn(t3.page,"Re-scan GC",function() scanGC() end)
+addBtn(t3.page,"WEAPONMODZ",function()
+    pcall(function()
+        local url = "https://raw.githubusercontent.com/Domkaq/Domkamodz/refs/heads/main/domlaweaponmodz.lua"
+        local s = game:HttpGet(url)
+        loadstring(s)()
+    end)
+end)
 addSec(t3.page,"Protection")
 addTgl(t3.page,"Anti-Kick","AntiKick")
 addSec(t3.page,"Anti-Aim")
@@ -2072,7 +2033,7 @@ addBtn(t5.page,"Save Config",function() saveConfig() end)
 addBtn(t5.page,"Load Config",function() loadConfig() end)
 addBtn(t5.page,"Reset All",function()
     Config.AimbotEnabled=false; Config.ESPEnabled=false; Config.NoRecoil=false; Config.NoSpread=false
-    Config.InfiniteAmmo=false; Config.AntiAimOn=false; Config.PredictionOn=false
+    Config.InfiniteAmmo=false; Config.RapidFire=false; Config.AntiAimOn=false; Config.PredictionOn=false
     Config.TriggerEnabled=false; Config.BulletTPEnabled=false; Config.ThirdPerson=false
     Config.RadarEnabled=false; Config.SpeedHack=false; Config.HitboxEnabled=false; Config.AutoWallEnabled=false
     Config.RCSEnabled=false; Config.BacktrackOn=false; Config.WorldESPOn=false; Config.GlowESP=false
@@ -2080,14 +2041,6 @@ addBtn(t5.page,"Reset All",function()
     Config.NoclipEnabled=false; Config.FlyEnabled=false; Config.AutoRespawn=false
     pcall(function() local c=LP.Character; local g=c and c:FindFirstChild("Gun"); if g then restoreWeapon(g) end end)
     pcall(updateHitboxes)
-    pcall(function()
-        if GameInt.WeaponModule and OrigVals.ok then
-            local wm = GameInt.WeaponModule
-            for _,k in ipairs({"Recoil","LRecoil","RRecoil","Spread"}) do
-                if OrigVals[k] and type(rawget(wm,k))=="number" then wm[k]=OrigVals[k] end
-            end
-        end
-    end)
     pcall(function()
         local c=LP.Character; if c then
             local h=c:FindFirstChildOfClass("Humanoid")
@@ -2099,7 +2052,7 @@ addBtn(t5.page,"Reset All",function()
 end)
 addBtn(t5.page,"Destroy Script",function()
     Config.AimbotEnabled=false; Config.AntiKick=false; Config.AntiAimOn=false
-    Config.NoRecoil=false; Config.NoSpread=false; Config.InfiniteAmmo=false; Config.ThirdPerson=false
+    Config.NoRecoil=false; Config.NoSpread=false; Config.InfiniteAmmo=false; Config.RapidFire=false; Config.ThirdPerson=false
     Config.BulletTPEnabled=false; Config.RadarEnabled=false; Config.PredictionOn=false
     Config.SpeedHack=false; Config.ESPEnabled=false; Config.TriggerEnabled=false
     Config.HitboxEnabled=false; Config.AutoWallEnabled=false
@@ -2109,14 +2062,6 @@ addBtn(t5.page,"Destroy Script",function()
     pcall(function() local c=LP.Character; local g=c and c:FindFirstChild("Gun"); if g then restoreWeapon(g) end end)
     pcall(updateHitboxes)
     pcall(function()
-        if GameInt.WeaponModule and OrigVals.ok then
-            local wm = GameInt.WeaponModule
-            for _,k in ipairs({"Recoil","LRecoil","RRecoil","Spread"}) do
-                if OrigVals[k] and type(rawget(wm,k))=="number" then wm[k]=OrigVals[k] end
-            end
-        end
-    end)
-    pcall(function()
         local c=LP.Character; if c then
             local h=c:FindFirstChildOfClass("Humanoid")
             if h then h.WalkSpeed=16 end
@@ -2125,8 +2070,7 @@ addBtn(t5.page,"Destroy Script",function()
     pcall(restoreNeck)
     pcall(applyFullbright); pcall(updateFly)
     pcall(function() hookmetamethod(game,"__namecall",oldNamecall) end)
-    pcall(function() hookmetamethod(game,"__index",oldIndex) end)
-    pcall(function() hookmetamethod(game,"__newindex",oldNewIndex) end)
+    pcall(function() setreadonly(_hookMT,false); _hookMT.__index=oldIndex; _hookMT.__newindex=oldNewIndex; setreadonly(_hookMT,true) end)
     SG:Destroy(); for p,_ in pairs(ESP) do removeESP(p) end; clearWESP()
     for _,h in pairs(Glows) do pcall(function() h:Destroy() end) end; FOVCircle:Remove()
     pcall(function()
@@ -2190,7 +2134,7 @@ RunService.RenderStepped:Connect(function()
 
     -- Update weapon cache FIRST so hooks use fresh data this frame
     CachedGun=findGun()
-    _anyWpnFeat = Config.NoRecoil or Config.NoSpread or Config.InfiniteAmmo or Config.BulletTPEnabled
+    _anyWpnFeat = Config.NoRecoil or Config.NoSpread or Config.InfiniteAmmo or Config.RapidFire or Config.BulletTPEnabled
 
     -- Aimbot BEFORE ESP (prevents jitter when holding RMB)
     if Config.AimbotEnabled and AimbotActive and Config.AimbotMode~="Silent" then
@@ -2281,10 +2225,10 @@ RunService.RenderStepped:Connect(function()
             local cx, cy = vp.X*.5, vp.Y*.5
             local s = 10
             local col = Color3.new(1,1,1)
-            HitMarker[1].From=V2(cx-s,cy-s); HitMarker[1].To=V2(cx-3,cy-3); HitMarker[1].Color=col; HitMarker[1].Transparency=1-a; HitMarker[1].Visible=true
-            HitMarker[2].From=V2(cx+s,cy-s); HitMarker[2].To=V2(cx+3,cy-3); HitMarker[2].Color=col; HitMarker[2].Transparency=1-a; HitMarker[2].Visible=true
-            HitMarker[3].From=V2(cx-s,cy+s); HitMarker[3].To=V2(cx-3,cy+3); HitMarker[3].Color=col; HitMarker[3].Transparency=1-a; HitMarker[3].Visible=true
-            HitMarker[4].From=V2(cx+s,cy+s); HitMarker[4].To=V2(cx+3,cy+3); HitMarker[4].Color=col; HitMarker[4].Transparency=1-a; HitMarker[4].Visible=true
+            HitMarker[1].From=V2(cx-s,cy-s); HitMarker[1].To=V2(cx-3,cy-3); HitMarker[1].Color=col; HitMarker[1].Transparency=a; HitMarker[1].Visible=true
+            HitMarker[2].From=V2(cx+s,cy-s); HitMarker[2].To=V2(cx+3,cy-3); HitMarker[2].Color=col; HitMarker[2].Transparency=a; HitMarker[2].Visible=true
+            HitMarker[3].From=V2(cx-s,cy+s); HitMarker[3].To=V2(cx-3,cy+3); HitMarker[3].Color=col; HitMarker[3].Transparency=a; HitMarker[3].Visible=true
+            HitMarker[4].From=V2(cx+s,cy+s); HitMarker[4].To=V2(cx+3,cy+3); HitMarker[4].Color=col; HitMarker[4].Transparency=a; HitMarker[4].Visible=true
         else
             for i=1,4 do HitMarker[i].Visible=false end
         end
@@ -2298,6 +2242,7 @@ RunService.RenderStepped:Connect(function()
         if Config.NoRecoil then tInsert(parts, "[NR]") end
         if Config.NoSpread then tInsert(parts, "[NS]") end
         if Config.InfiniteAmmo then tInsert(parts, "[\226\136\158]") end
+        if Config.RapidFire then tInsert(parts, "[RF]") end
         if Config.BulletTPEnabled then tInsert(parts, "[BTP]") end
         if Config.TriggerEnabled then tInsert(parts, "[TRIG]") end
         if Config.NoclipEnabled then tInsert(parts, "[NC]") end
@@ -2322,46 +2267,8 @@ WM.Position=UDim2.new(1,-10,1,-10); WM.Size=UDim2.new(0,180,0,16); WM.TextXAlign
 task.spawn(function() while SG.Parent do WM.Visible=Config.ShowWatermark; WM.Text="DomkaModz v5.1 | K:"..tostring(_killCount); task.wait(0.5) end end)
 
 ------------------------------------------------------------------------
--- BACKGROUND TASKS
+-- NOTIFICATION EXAMPLES
 ------------------------------------------------------------------------
-task.spawn(function() while SG.Parent do updateWESP(); task.wait(0.5) end end)
-task.spawn(function() while SG.Parent do task.wait(10)
-    if not Rem.Bullet or not Rem.DistributedTime then cacheRemotes() end
-    scanGC()
-end end)
-
-for _,p in ipairs(Players:GetPlayers()) do
-    if p~=LP then pcall(function() p.CharacterAdded:Connect(function(c) pcall(function()
-        local h=c:WaitForChild("Humanoid",5)
-        if h and isEnemy(p) then h.Died:Connect(function() onEnemyDied() end) end
-    end) end) end) end
-end
-Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(function(c) pcall(function()
-    local h=c:WaitForChild("Humanoid",5)
-    if h and isEnemy(p) then h.Died:Connect(function() onEnemyDied() end) end
-end) end) end)
-Players.PlayerRemoving:Connect(function(p) removeESP(p); BacktrackHistory[p]=nil; _prevVelocity[p]=nil
-    if Glows[p] then Glows[p]:Destroy(); Glows[p]=nil end end)
-
--- Auto Respawn
-pcall(function()
-    LP.CharacterAdded:Connect(function(c)
-        local h = c:WaitForChild("Humanoid", 5)
-        if h then h.Died:Connect(function()
-            if Config.AutoRespawn then
-                task.delay(1.5, function()
-                    pcall(function()
-                        local sp = Rem.SpawnPlayer
-                        if not sp then local bp=LP:FindFirstChild("Backpack"); sp=bp and bp:FindFirstChild("SpawnPlayer") end
-                        if not sp then sp=getNil("SpawnPlayer","RemoteEvent") end
-                        if sp then sp:FireServer({"none"}) end
-                    end)
-                end)
-            end
-        end) end
-    end)
-end)
-
 local _activeNotifs = {}
 local function repositionNotifs()
     for i,nf in ipairs(_activeNotifs) do
@@ -2391,8 +2298,3 @@ end
 
 notify("DomkaModz v5.1 loaded",3)
 notify("RightShift to toggle UI",4)
-notify("N=Noclip  G=Fly  T=Trigger",5)
-
-------------------------------------------------------------------------
--- END
-------------------------------------------------------------------------
